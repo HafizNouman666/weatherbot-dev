@@ -1002,4 +1002,4 @@ def internal_server_error(error):
 
 if __name__ == "__main__":
     logger.info("Starting Weather Assistant API server")
-    app.run(debug=False, host='0.0.0.0', port=8028)
+    app.run(debug=False, host='0.0.0.0', port=8029)
