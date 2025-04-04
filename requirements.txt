@@ -1,0 +1,13 @@
+ipython
+langgraph
+requests
+langchain-core
+langchain-openai
+langchain-google-genai
+python-dotenv
+langchain-community
+typing-extensions
+flask
+gtts
+pydub
+openai
