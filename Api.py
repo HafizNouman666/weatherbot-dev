@@ -62,7 +62,7 @@ client = openai.OpenAI(api_key=openai_api_key)
 
 llm = ChatOpenAI(
     model="gpt-4-turbo",  # or "gpt-4-turbo" if you prefer GPT-4
-    temperature=0.1,
+    temperature=0.2,
     api_key=os.getenv("OPENAI_API_KEY"),
 )
 
@@ -466,18 +466,88 @@ graph_builder.add_edge("tools", "context_updater")
 # Explicitly compile with return_only=True
 react_graph = graph_builder.compile()
 
-def convert_audio_to_wav(input_audio):
-    """Convert audio file to WAV format (16kHz, mono) for processing."""
-    temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-    try:
-        audio = AudioSegment.from_file(input_audio)
-        audio = audio.set_frame_rate(16000).set_channels(1)
-        audio.export(temp_wav, format="wav")
-        return temp_wav
-    except Exception as e:
-        logger.error(f"Error converting audio to WAV: {str(e)}")
-        return None
+# def convert_audio_to_wav(input_audio):
+#     """Convert audio file to WAV format (16kHz, mono) for processing."""
+#     temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+#     try:
+#         audio = AudioSegment.from_file(input_audio)
+#         audio = audio.set_frame_rate(16000).set_channels(1)
+#         audio.export(temp_wav, format="wav")
+#         return temp_wav
+#     except Exception as e:
+#         logger.error(f"Error converting audio to WAV: {str(e)}")
+#         return None
 
+def convert_audio_to_wav(input_audio):
+    """
+    Convert audio file to WAV format (16kHz, mono) for processing.
+    Includes advanced error handling and multiple fallback methods.
+    
+    Args:
+        input_audio (str): Path to the input audio file
+        
+    Returns:
+        str: Path to the converted WAV file or None if conversion fails
+    """
+    import os
+    import tempfile
+    import subprocess
+    from pydub import AudioSegment
+    
+    temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+    logger.info(f"Attempting to convert audio file: {input_audio} to WAV format at {temp_wav}")
+    
+    try:
+        # Method 1: Try using pydub's from_file with format hint
+        try:
+            file_ext = os.path.splitext(input_audio)[1].lower().lstrip('.')
+            logger.info(f"Detected file extension: {file_ext}")
+            
+            # Explicitly specify format to help pydub
+            audio = AudioSegment.from_file(input_audio, format=file_ext)
+            audio = audio.set_frame_rate(16000).set_channels(1)
+            audio.export(temp_wav, format="wav")
+            logger.info("Successfully converted audio using pydub with format hint")
+            return temp_wav
+        except Exception as e:
+            logger.warning(f"Method 1 failed: {str(e)}")
+            
+        # Method 2: Try using pydub without format hint
+        try:
+            audio = AudioSegment.from_file(input_audio)
+            audio = audio.set_frame_rate(16000).set_channels(1)
+            audio.export(temp_wav, format="wav")
+            logger.info("Successfully converted audio using pydub without format hint")
+            return temp_wav
+        except Exception as e:
+            logger.warning(f"Method 2 failed: {str(e)}")
+            
+        # Method 3: Try using ffmpeg directly (if available)
+        try:
+            cmd = ['ffmpeg', '-i', input_audio, '-ar', '16000', '-ac', '1', '-y', temp_wav]
+            logger.info(f"Trying ffmpeg with command: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.info(f"Successfully converted audio using ffmpeg: {result.stdout}")
+            return temp_wav
+        except Exception as e:
+            logger.warning(f"Method 3 failed (ffmpeg): {str(e)}")
+            
+        # If all methods failed, raise exception
+        raise Exception("All conversion methods failed")
+            
+    except Exception as e:
+        error_msg = f"Failed to convert audio to WAV: {str(e)}"
+        logger.error(error_msg)
+        
+        # Clean up the temp file if it exists
+        if os.path.exists(temp_wav):
+            try:
+                os.remove(temp_wav)
+                logger.info(f"Removed temporary WAV file: {temp_wav}")
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to remove temporary file: {str(cleanup_error)}")
+        
+        return None
 
 def transcribe_audio(audio_file_path):
     """
@@ -490,16 +560,44 @@ def transcribe_audio(audio_file_path):
     Returns:
         str: Transcribed text
     """
+    wav_file_path = None
+    
     try:
         logger.info(f"Preparing to transcribe audio file: {audio_file_path}")
+        file_size = os.path.getsize(audio_file_path)
+        logger.info(f"Audio file size: {file_size} bytes")
+        
+        # Get file extension
+        file_ext = os.path.splitext(audio_file_path)[1].lower()
+        logger.info(f"Audio file extension: {file_ext}")
         
         # Convert audio to 16kHz WAV format for Whisper
         wav_file_path = convert_audio_to_wav(audio_file_path)
         
-        if wav_file_path is None:
-            raise Exception("Failed to convert audio to WAV format")
+        if not wav_file_path or not os.path.exists(wav_file_path):
+            # Try a direct approach with Whisper API if conversion fails
+            logger.warning("WAV conversion failed, attempting to use the original file directly")
+            
+            with open(audio_file_path, "rb") as audio_file:
+                try:
+                    transcription = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file
+                    )
+                    transcribed_text = transcription.text
+                    logger.info(f"Direct transcription successful: {transcribed_text[:100]}...")
+                    
+                    additional_prompt = f"\nAdditional Instructions: Reply in Same Langauage as Message (Roman->Roman, English->Englihs, Urdu->Urdu){future_datetime}"
+                    message = transcribed_text + additional_prompt
+                    return message
+                except Exception as direct_error:
+                    logger.error(f"Direct transcription also failed: {str(direct_error)}")
+                    raise Exception(f"Both conversion and direct transcription failed: {str(direct_error)}")
         
         logger.info(f"Converted audio to WAV format: {wav_file_path}")
+        if os.path.exists(wav_file_path):
+            wav_size = os.path.getsize(wav_file_path)
+            logger.info(f"WAV file size: {wav_size} bytes")
         
         # Use the converted WAV file for transcription
         with open(wav_file_path, "rb") as audio_file:
@@ -509,29 +607,30 @@ def transcribe_audio(audio_file_path):
             )
         
         transcribed_text = transcription.text
-        logger.info(f"Transcription successful: {transcribed_text[:500]}...")
+        logger.info(f"Transcription successful: {transcribed_text[:100]}...")
         
-        # Clean up the temporary WAV file
-        try:
-            os.remove(wav_file_path)
-        except Exception as e:
-            logger.warning(f"Error removing temporary WAV file: {str(e)}")
         additional_prompt = f"\nAdditional Instructions: Reply in Same Langauage as Message (Roman->Roman, English->Englihs, Urdu->Urdu){future_datetime}"
-        message = transcribed_text+additional_prompt
+        message = transcribed_text + additional_prompt
         return message
     
     except Exception as e:
         logger.error(f"Error transcribing audio: {str(e)}")
         logger.error(traceback.format_exc())
         
+        # Handle the case where no text was transcribed
+        # Return a fallback message instead of raising an exception
+        fallback_message = "Sorry, I couldn't understand the audio. Could you please try again or type your message?"
+        logger.warning(f"Using fallback message: {fallback_message}")
+        return fallback_message
+    
+    finally:
         # Clean up temp files if they exist
-        if 'wav_file_path' in locals() and wav_file_path and os.path.exists(wav_file_path):
+        if wav_file_path and os.path.exists(wav_file_path):
             try:
                 os.remove(wav_file_path)
-            except:
-                pass
-                
-        raise Exception(f"Transcription failed: {str(e)}")
+                logger.info(f"Removed temporary WAV file: {wav_file_path}")
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup WAV file: {str(cleanup_error)}")
 
 
 def text_to_speech(text, voice="ash", speed=1.0):
@@ -590,6 +689,7 @@ def text_to_speech(text, voice="ash", speed=1.0):
 def process_audio_to_chat(audio_file_path, state=None):
     """
     Process audio input through transcription, chatbot, and text-to-speech.
+    Robust error handling ensures the function doesn't crash.
     
     Args:
         audio_file_path (str): Path to the audio file
@@ -599,47 +699,118 @@ def process_audio_to_chat(audio_file_path, state=None):
         tuple: (updated_state, response_text, audio_io, saved_path, weather_data)
     """
     try:
+        # Check if file exists
+        if not os.path.isfile(audio_file_path):
+            logger.error(f"Audio file does not exist: {audio_file_path}")
+            error_message = "The audio file could not be found."
+            return generate_error_response(state, error_message)
+        
+        # Check file size
+        file_size = os.path.getsize(audio_file_path)
+        logger.info(f"Processing audio file: {audio_file_path}, Size: {file_size} bytes")
+        
+        if file_size == 0:
+            logger.error("Audio file is empty (0 bytes)")
+            error_message = "The audio file is empty. Please try again with a valid recording."
+            return generate_error_response(state, error_message)
+        
         # Step 1: Transcribe the audio
         transcribed_text = transcribe_audio(audio_file_path)
         logger.info(f"Transcribed text: {transcribed_text}")
         
-        # Step 2: Log existing context if available
-        if state and "conversation_context" in state:
-            context = state.get("conversation_context", {})
-            logger.info(f"Processing with existing context: last_location={context.get('last_location', 'None')}")
-        else:
-            logger.info("Processing without existing context")
+        # If transcription returned a fallback message (error case)
+        if transcribed_text.startswith("Sorry, I couldn't understand"):
+            error_message = transcribed_text
+            return generate_error_response(state, error_message)
         
-        # Step 3: Send the transcribed text to the chatbot
+        # Step 2: Process with chat bot
         updated_state, response_text, weather_data = chat_with_bot(transcribed_text, "audio", state)
         
-        # Step 4: Log updated context
-        if updated_state and "conversation_context" in updated_state:
-            updated_context = updated_state.get("conversation_context", {})
-            logger.info(f"Updated context: last_location={updated_context.get('last_location', 'None')}")
-        
-        # Step 5: Choose appropriate voice based on language detection
-        # Simple detection for Urdu text - adjust if needed
-        has_urdu_chars = any(ord(c) > 1536 and ord(c) < 1791 for c in response_text)
-        
-        # Select voice and speed based on language
-        voice = "alloy"  # Default voice for English
-        speed = 1.0    # Default speed
-        
-        if has_urdu_chars:
-            # For Urdu text, you might prefer a different voice
-            voice = "alloy"  # Adjust based on which voice sounds best for Urdu
-            speed = 1.0     # Slightly slower for non-English languages
-        
-        # Step 6: Convert the response text to speech using OpenAI TTS
-        audio_io, saved_path = text_to_speech(response_text, voice=voice, speed=speed)
-        
-        return updated_state, response_text, audio_io, saved_path, weather_data
+        # Step 3: Convert response to speech
+        try:
+            # Choose voice based on language
+            has_urdu_chars = any(ord(c) > 1536 and ord(c) < 1791 for c in response_text)
+            voice = "alloy"  # Default voice
+            speed = 1.0      # Default speed
+            
+            audio_io, saved_path = text_to_speech(response_text, voice=voice, speed=speed)
+            return updated_state, response_text, audio_io, saved_path, weather_data
+            
+        except Exception as tts_error:
+            logger.error(f"Text-to-speech failed: {str(tts_error)}")
+            # If TTS fails, still return the text response
+            error_mp3 = create_error_audio()
+            return updated_state, response_text, None, error_mp3, weather_data
     
     except Exception as e:
-        logger.error(f"Error processing audio to chat: {str(e)}")
-        logger.error(traceback.format_exc())  
-        raise Exception(f"Audio processing failed: {str(e)}")
+        logger.error(f"Error in process_audio_to_chat: {str(e)}")
+        logger.error(traceback.format_exc())
+        error_message = "I'm sorry, I encountered an error processing your audio. Please try again."
+        return generate_error_response(state, error_message)
+
+def generate_error_response(state, error_message):
+    """
+    Generate a standard error response for audio processing failures.
+    
+    Args:
+        state: The current conversation state
+        error_message: The error message to include in the response
+        
+    Returns:
+        tuple: (state, error_message, None, error_audio_path, None)
+    """
+    try:
+        # Create an error audio file
+        error_audio_path = create_error_audio(error_message)
+        return state, error_message, None, error_audio_path, None
+    except Exception as e:
+        logger.error(f"Failed to generate error response: {str(e)}")
+        # Last resort fallback
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = os.path.join(os.getcwd(), "saved_responses")
+        os.makedirs(save_dir, exist_ok=True)
+        fallback_path = os.path.join(save_dir, f"error_{timestamp}.mp3")
+        
+        # Create an empty MP3 file as absolute last resort
+        with open(fallback_path, 'wb') as f:
+            f.write(b'')
+            
+        return state, error_message, None, fallback_path, None
+
+def create_error_audio(message="I'm sorry, I couldn't process your audio. Please try again."):
+    """
+    Create an audio file with an error message.
+    
+    Args:
+        message: The error message to convert to speech
+        
+    Returns:
+        str: Path to the error audio file
+    """
+    try:
+        audio_io, saved_path = text_to_speech(message, voice="alloy", speed=1.0)
+        return saved_path
+    except Exception as e:
+        logger.error(f"Failed to create error audio: {str(e)}")
+        
+        # Create a simple audio file using gTTS as fallback
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_dir = os.path.join(os.getcwd(), "saved_responses")
+            os.makedirs(save_dir, exist_ok=True)
+            fallback_path = os.path.join(save_dir, f"error_{timestamp}.mp3")
+            
+            tts = gTTS(text=message, lang='en', slow=False)
+            tts.save(fallback_path)
+            return fallback_path
+        except Exception as gtts_error:
+            logger.error(f"gTTS fallback also failed: {str(gtts_error)}")
+            
+            # Create an empty MP3 file as absolute last resort
+            empty_path = os.path.join(save_dir, f"empty_error_{timestamp}.mp3")
+            with open(empty_path, 'wb') as f:
+                f.write(b'')
+            return empty_path
 
 
 def chat_with_bot(message, bottype, state=None):
@@ -754,7 +925,7 @@ def api_chat():
         state = user_states.get(user_id)
         
         # Create a variable to store weather API response
-        weather_api_data = None
+        #weather_api_data = None
         
         # Process the message with retry mechanism
         max_retries = 3
@@ -777,7 +948,7 @@ def api_chat():
             context = new_state["conversation_context"]
         
         logger.info(f"Returning response: {response[:50]}...")
-        
+        print(weather_api_data)
         # Include weather_api_response in the JSON response
         return jsonify({
             "status": "success",
@@ -797,6 +968,9 @@ def api_chat():
 
 @app.route('/api/audio-chat', methods=['POST'])
 def api_audio_chat():
+    temp_dir = None
+    temp_audio_path = None
+    
     try:
         # Check if an audio file is included in the request
         if 'audio' not in request.files:
@@ -817,9 +991,12 @@ def api_audio_chat():
                 "message": "No audio file selected",
                 "code": 400
             }), 400
+            
+        # Log file information to help with debugging
+        file_ext = os.path.splitext(audio_file.filename)[1].lower()
+        logger.info(f"Received audio file: {audio_file.filename} with extension {file_ext}")
         
         # Get user ID from the request or use default
-        # Allow the client to specify a session ID to maintain conversation across requests
         user_id = request.form.get('user_id', 'default')
         logger.info(f"Processing audio chat for user_id: {user_id}")
             
@@ -835,22 +1012,12 @@ def api_audio_chat():
         # Get existing state for the user
         state = user_states.get(user_id)
         
-        # Log the current conversation context
-        if state and "conversation_context" in state:
-            logger.info(f"Using existing conversation context: {state['conversation_context']}")
-        else:
-            logger.info("No existing conversation context found")
-        
         # Process the audio
         try:
             updated_state, response_text, audio_response, saved_path, weather_data = process_audio_to_chat(temp_audio_path, state)
             
             # Update the user's state in the global dictionary
             user_states[user_id] = updated_state
-            
-            # Log the updated conversation context
-            if "conversation_context" in updated_state:
-                logger.info(f"Updated conversation context: {updated_state['conversation_context']}")
             
             # Prepare the JSON data with metadata
             response_data = {
@@ -859,7 +1026,7 @@ def api_audio_chat():
                 "transcribed_text": response_text,
                 "saved_file_path": saved_path,
                 "weather_api_response": weather_data,
-                "user_id": user_id  # Include the user_id in the response
+                "user_id": user_id
             }
             
             # Create a response object with the file
@@ -876,20 +1043,14 @@ def api_audio_chat():
             return response
             
         except Exception as e:
-            logger.error(f"Error processing audio: {str(e)}")
+            error_msg = f"Error processing audio: {str(e)}"
+            logger.error(error_msg)
             logger.error(traceback.format_exc())
             return jsonify({
                 "status": "error",
-                "message": f"Error processing audio: {str(e)}",
+                "message": error_msg,
                 "code": 500
             }), 500
-        finally:
-            # Clean up temporary files
-            try:
-                os.remove(temp_audio_path)
-                os.rmdir(temp_dir)
-            except Exception as e:
-                logger.warning(f"Error cleaning up temporary files: {str(e)}")
         
     except Exception as e:
         logger.error(f"API error in audio chat: {str(e)}")
@@ -899,6 +1060,19 @@ def api_audio_chat():
             "message": f"An internal server error occurred: {str(e)}",
             "code": 500
         }), 500
+    finally:
+        # Clean up temporary files
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            try:
+                os.remove(temp_audio_path)
+            except Exception as e:
+                logger.warning(f"Error removing temporary audio file: {str(e)}")
+        
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                os.rmdir(temp_dir)
+            except Exception as e:
+                logger.warning(f"Error removing temporary directory: {str(e)}")
 
 
 def process_audio_to_chat(audio_file_path, state=None):
