@@ -47,20 +47,21 @@ logging.basicConfig(
 )
 
 # Configure logging
-# Load environment variables
-
 
 logger = logging.getLogger(__name__)
 load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
-
+print("Api key -------"+openai_api_key)
 # Configure OpenAI client
+
+# Load environment variables
+
 
 client = openai.OpenAI(api_key=openai_api_key)
 
 
 llm = ChatOpenAI(
-    model="gpt-4-turbo",  # or "gpt-4-turbo" if you prefer GPT-4
+    model="gpt-4o-mini",  # or "gpt-4-turbo" if you prefer GPT-4
     temperature=0.2,
     api_key=os.getenv("OPENAI_API_KEY"),
 )
@@ -91,7 +92,7 @@ LOCATION HANDLING:
   isl, isb → islamabad | lh, lhr → lahore | karc, khi, krc → karachi
   pindi, rwp → rawalpindi | mul → multan | faisl, fsd → faisalabad
   gujr, grw → gujranwala | kashmir → kashmir
-- Default location: Islamabad (use automatically if no location provided).
+- Default location: Nust (use automatically if no location provided).
 - In follow-up queries, use the most recently mentioned location.
 
 RESPONSE FORMAT:
@@ -172,53 +173,57 @@ GUIDELINES:
 - if user ask about current temperature or todays weather tell us according to the current date and time.which is **{future_datetime} and match this time that present in JSON response**
 """
 
-
-
 # Your existing geocoding and weather functions can remain the same
 @lru_cache(maxsize=100)
 def get_coordinates(location_name: str) -> Dict[str, Any]:
+    """
+    Fetches latitude, longitude and a display name for a given location
+    from WeatherWalay's location/search API instead of Google.
+    """
     logger.info(f"Cache info: {get_coordinates.cache_info()}")
-
-    """Geocodes a location name to get its latitude and longitude coordinates."""
     try:
-        logger.info(f"Geocoding location: {location_name}")
-        url = "https://nominatim.openstreetmap.org/search"
-        
-        params = {
-            "q": location_name,
-            "format": "json",
-            "limit": 1,
-        }
-        
-        headers = {
-            "User-Agent": "WeatherBot/1.0"
-        }
-        response = session.get(url, params=params, headers=headers)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        if not data:
-            logger.warning(f"Could not find coordinates for location: {location_name}")
-            return {"error": f"Could not find coordinates for location: {location_name}"}
-        
-        result = data[0]
-        logger.info(f"Found coordinates for {location_name}: lat={result.get('lat')}, lon={result.get('lon')}")
+        logger.info(f"Looking up coordinates for: {location_name}")
+        url = "https://services.weatherwalay.com/location/search"
+        auth = ("Kalambot", "Ww_12365")
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        data = {"searchWord": location_name}
+
+        resp = session.post(url, auth=auth, headers=headers, data=data)
+        resp.raise_for_status()
+
+        payload = resp.json()
+        if not payload.get("success"):
+            msg = payload.get("msg", "Unknown error from location API")
+            logger.warning(f"Location API returned failure: {msg}")
+            return {"error": msg}
+
+        records = payload.get("record", {}).get("response", [])
+        if not records:
+            msg = f"No location found for '{location_name}'"
+            logger.warning(msg)
+            return {"error": msg}
+
+        first = records[0]
+        lat = float(first["lat"])
+        lng = float(first["lng"])
+        display = first.get("address", first.get("city", location_name))
+
+        logger.info(f"Found {location_name} → lat={lat}, lon={lng}, display='{display}'")
         return {
-            "latitude": float(result.get("lat")),
-            "longitude": float(result.get("lon")),
-            "display_name": result.get("display_name")
+            "latitude": lat,
+            "longitude": lng,
+            "display_name": display
         }
-        
+
     except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error occurred during geocoding: {str(e)}")
-        return {"error": f"HTTP error occurred during geocoding: {str(e)}"}
+        logger.error(f"HTTP error during location lookup: {e}")
+        return {"error": str(e)}
     except requests.exceptions.RequestException as e:
-        logger.error(f"Request failed during geocoding: {str(e)}")
-        return {"error": f"Request failed during geocoding: {str(e)}"}
+        logger.error(f"Request failed during location lookup: {e}")
+        return {"error": str(e)}
     except Exception as e:
-        logger.error(f"An unexpected error occurred during geocoding: {str(e)}")
-        return {"error": f"An unexpected error occurred during geocoding: {str(e)}"}
+        logger.error(f"Unexpected error in get_coordinates: {e}")
+        return {"error": str(e)}
 
 @cached(weather_cache)
 def get_weather(latitude: float, longitude: float) -> Dict[str, Any]:
@@ -953,7 +958,7 @@ def api_chat():
             "status": "success",
             "code": 200,
             "response": response,
-            "weather_api_response": weather_api_data  # Add the weather API data to the response
+          
         })
     
     except Exception as e:

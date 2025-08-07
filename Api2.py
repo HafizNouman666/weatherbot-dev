@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 import logging
+from flask_cors import CORS
 import traceback
 from IPython.display import Image, display
 from langgraph.graph import StateGraph, START, END
@@ -15,6 +16,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 from gtts import gTTS
 from io import BytesIO
+import subprocess
 from pydub import AudioSegment
 import json
 import os
@@ -47,20 +49,21 @@ logging.basicConfig(
 )
 
 # Configure logging
-# Load environment variables
-
 
 logger = logging.getLogger(__name__)
 load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
-
+print("Api key -------"+openai_api_key)
 # Configure OpenAI client
+
+# Load environment variables
+
 
 client = openai.OpenAI(api_key=openai_api_key)
 
 
 llm = ChatOpenAI(
-    model="gpt-4-turbo",  # or "gpt-4-turbo" if you prefer GPT-4
+    model="gpt-4o-mini",  
     temperature=0.2,
     api_key=os.getenv("OPENAI_API_KEY"),
 )
@@ -79,6 +82,10 @@ You are a friendly weather assistant named (WeatherWalaBot) with access to real-
 AVAILABLE TOOLS:
 - get_weather_by_location(location_name): Fetches weather data for a given location name.
 - get_weather(latitude, longitude): Fetches weather data for given coordinates.
+- If user asks for **today's weather**, call `fetch_today_weather_by_location`.
+- If user asks for **hourly**, **now**, or **specific hour**, call `fetch_hourly_weather_by_location` and match timestamp with user intent.
+- If user asks about **another date or tomorrow**, call `fetch_forecast_weather_by_location` and extract relevant date/day/hour.
+- Match timestamps like `2025-08-06T14:00:00+0500` to user’s local time automatically.
 
 - **Language Handling:**
     - For Roman Urdu reply in Roman Strictly   (not in urdu)
@@ -91,7 +98,7 @@ LOCATION HANDLING:
   isl, isb → islamabad | lh, lhr → lahore | karc, khi, krc → karachi
   pindi, rwp → rawalpindi | mul → multan | faisl, fsd → faisalabad
   gujr, grw → gujranwala | kashmir → kashmir
-- Default location: Islamabad (use automatically if no location provided).
+- Default location: Nust (use automatically if no location provided).
 - In follow-up queries, use the most recently mentioned location.
 
 RESPONSE FORMAT:
@@ -172,153 +179,228 @@ GUIDELINES:
 - if user ask about current temperature or todays weather tell us according to the current date and time.which is **{future_datetime} and match this time that present in JSON response**
 """
 
-
-
 # Your existing geocoding and weather functions can remain the same
 @lru_cache(maxsize=100)
 def get_coordinates(location_name: str) -> Dict[str, Any]:
+    """
+    Fetches latitude, longitude and a display name for a given location
+    from WeatherWalay's location/search API instead of Google.
+    """
     logger.info(f"Cache info: {get_coordinates.cache_info()}")
-
-    """Geocodes a location name to get its latitude and longitude coordinates."""
     try:
-        logger.info(f"Geocoding location: {location_name}")
-        url = "https://nominatim.openstreetmap.org/search"
-        
-        params = {
-            "q": location_name,
-            "format": "json",
-            "limit": 1,
-        }
-        
-        headers = {
-            "User-Agent": "WeatherBot/1.0"
-        }
-        response = session.get(url, params=params, headers=headers)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        if not data:
-            logger.warning(f"Could not find coordinates for location: {location_name}")
-            return {"error": f"Could not find coordinates for location: {location_name}"}
-        
-        result = data[0]
-        logger.info(f"Found coordinates for {location_name}: lat={result.get('lat')}, lon={result.get('lon')}")
+        logger.info(f"Looking up coordinates for: {location_name}")
+        url = "https://services.weatherwalay.com/location/search"
+        auth = ("Kalambot", "Ww_12365")
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        data = {"searchWord": location_name}
+
+        resp = session.post(url, auth=auth, headers=headers, data=data)
+        resp.raise_for_status()
+
+        payload = resp.json()
+        if not payload.get("success"):
+            msg = payload.get("msg", "Unknown error from location API")
+            logger.warning(f"Location API returned failure: {msg}")
+            return {"error": msg}
+
+        records = payload.get("record", {}).get("response", [])
+        if not records:
+            msg = f"No location found for '{location_name}'"
+            logger.warning(msg)
+            return {"error": msg}
+
+        first = records[0]
+        lat = float(first["lat"])
+        lng = float(first["lng"])
+        display = first.get("address", first.get("city", location_name))
+
+        logger.info(f"Found {location_name} → lat={lat}, lon={lng}, display='{display}'")
         return {
-            "latitude": float(result.get("lat")),
-            "longitude": float(result.get("lon")),
-            "display_name": result.get("display_name")
+            "latitude": lat,
+            "longitude": lng,
+            "display_name": display
         }
-        
+
     except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error occurred during geocoding: {str(e)}")
-        return {"error": f"HTTP error occurred during geocoding: {str(e)}"}
+        logger.error(f"HTTP error during location lookup: {e}")
+        return {"error": str(e)}
     except requests.exceptions.RequestException as e:
-        logger.error(f"Request failed during geocoding: {str(e)}")
-        return {"error": f"Request failed during geocoding: {str(e)}"}
+        logger.error(f"Request failed during location lookup: {e}")
+        return {"error": str(e)}
     except Exception as e:
-        logger.error(f"An unexpected error occurred during geocoding: {str(e)}")
-        return {"error": f"An unexpected error occurred during geocoding: {str(e)}"}
+        logger.error(f"Unexpected error in get_coordinates: {e}")
+        return {"error": str(e)}
 
 @cached(weather_cache)
 def get_weather(latitude: float, longitude: float) -> Dict[str, Any]:
-    """Fetches weather data for given coordinates and returns a simplified response."""
     try:
-        logger.info(f"Fetching weather data for coordinates: lat={latitude}, lon={longitude}")
-        # Define the API endpoint URL
-        url = "https://services.weatherwalay.com/v2/weather/byLatLong"
-        
-        # Basic Authentication credentials
-        auth = ("Kalambot", "Ww_12365")
-        
-        # Headers for the POST request
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-        
-        # Data to be sent in the POST request
-        data = {
-            "lat": latitude,
-            "long": longitude
-        }
-        
-        # Make the POST request to the weather API
-
-        response = session.post(url, auth=auth, headers=headers, data=data)
-        response.raise_for_status()  # Raise an error if the request fails
-        
-        # Parse the JSON response
+        # Fetch from WeatherWalay
+        response = session.post(
+            "https://services.weatherwalay.com/v2/weather/byLatLong",
+            auth=("Kalambot", "Ww_12365"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={"lat": latitude, "long": longitude}
+        )
+        response.raise_for_status()
         api_response = response.json()
-        
-        # Check if the API call was successful
-        if response.status_code != 200 or not api_response.get('success'):
-            logger.warning("Currently, weather information is unavailable. Please try again shortly.")
-            return {"error": "Currently, weather information is unavailable. Please try again shortly."}
-            
-        # Extract and simplify the weather data
-        if not api_response.get('record') or not api_response.get('record').get('daily'):
-            logger.warning("Invalid response format from weather API")
-            return {"error": "Currently, weather information is unavailable. Please try again shortly."}
-        
-        record = api_response['record']
-        daily_data = record.get('daily', [])
-        
-        # Create a simplified response
-        simplified_weather = {
-            "current": {},
-            "forecast": []
-        }
-        
-        # Process current day and forecast
+
+        if not api_response.get("success"):
+            return {"error": "Weather unavailable."}
+
+        daily_data = api_response["record"].get("daily", [])
+        now = datetime.datetime.now(datetime.timezone.utc).astimezone().isoformat()
+
+        simplified = {"current_timestamp": now, "forecast": []}
+
         for i, day in enumerate(daily_data):
-            day_data = {
-                "date": day.get('date'),
-                "day_of_week": day.get('dayOfWeek'),
-                "condition": day.get('weatherConditionEnglish'),
-                "temperature": day.get('temp'),
-                "min_temperature": day.get('minTemp'),
-                "max_temperature": day.get('maxTemp'),
-                "humidity": day.get('hum'),
-                "pressure": day.get('pressure'),
-                "wind_speed": day.get('windSpeed'),
-                "cloud_cover": day.get('cloudCover'),
-                "uv_index": day.get('uv'),
-                "precipitation_type": day.get('precType'),
-                "sunrise": day.get('sunrise'),
-                "sunset": day.get('sunset')
+            day_entry = {
+                "date": day["date"],
+                "day_of_week": day.get("dayOfWeek"),
+                "condition": day.get("weatherConditionEnglish"),
+                "temperature": day.get("temp"),
+                "min_temperature": day.get("minTemp"),
+                "max_temperature": day.get("maxTemp"),
+                "humidity": day.get("hum"),
+                "pressure": day.get("pressure"),
+                "wind_speed": day.get("windSpeed"),
+                "cloud_cover": day.get("cloudCover"),
+                "uv_index": day.get("uv"),
+                "precipitation_type": day.get("precType"),
+                "sunrise": day.get("sunrise"),
+                "sunset": day.get("sunset"),
+                "day_parts": [],
+                "hourly_flattened": []
             }
-            
-            # Add daily parts breakdown if available
-            if day.get('intraday'):
-                day_data["day_parts"] = []
-                for part in day.get('intraday', []):
-                    day_data["day_parts"].append({
-                        "name": part.get('daypartName'),
-                        "min_temp": part.get('minTemp'),
-                        "max_temp": part.get('maxTemp'),
-                        "condition": part.get('english'),
-                        "day_or_night": "Day" if part.get('dayOrNight') == 'D' else "Night"
+
+            for part in day.get("intraday", []):
+                dp = {
+                    "name": part["daypartName"],
+                    "min_temp": part["minTemp"],
+                    "max_temp": part["maxTemp"],
+                    "condition": part["english"],
+                    "day_or_night": "Day" if part["dayOrNight"] == "D" else "Night",
+                    "range": part.get("range", [])
+                }
+                day_entry["day_parts"].append(dp)
+
+                for hour in part.get("range", []):
+                    day_entry["hourly_flattened"].append({
+                        "timestamp": hour,
+                        "daypart": part["daypartName"],
+                        "condition": part["english"],
+                        "min_temp": part["minTemp"],
+                        "max_temp": part["maxTemp"]
                     })
-            
-            # First day is current day
+
             if i == 0:
-                simplified_weather["current"] = day_data
-            
-            # All days go to forecast
-            simplified_weather["forecast"].append(day_data)
-        
-        logger.info("Weather data successfully fetched and processed")
-        return simplified_weather
-        
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error occurred while fetching weather: {str(e)}")
-        return {"error": f"HTTP error occurred: {str(e)}"}
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request failed while fetching weather: {str(e)}")
-        return {"error": f"Request failed: {str(e)}"}
+                simplified["current"] = day_entry
+
+            simplified["forecast"].append(day_entry)
+
+        return simplified
+
     except Exception as e:
-        logger.error(f"An unexpected error occurred while fetching weather: {str(e)}")
-        return {"error": f"An unexpected error occurred: {str(e)}"}
+        return {"error": str(e)}
+
+
+# def get_weather(latitude: float, longitude: float) -> Dict[str, Any]:
+#     """Fetches weather data for given coordinates and returns a simplified response."""
+#     try:
+#         logger.info(f"Fetching weather data for coordinates: lat={latitude}, lon={longitude}")
+#         Define the API endpoint URL
+#         url = "https://services.weatherwalay.com/v2/weather/byLatLong"
+        
+#         Basic Authentication credentials
+#         auth = ("Kalambot", "Ww_12365")
+        
+#         Headers for the POST request
+#         headers = {
+#             "Content-Type": "application/x-www-form-urlencoded"
+#         }
+        
+#         Data to be sent in the POST request
+#         data = {
+#             "lat": latitude,
+#             "long": longitude
+#         }
+        
+#         Make the POST request to the weather API
+
+#         response = session.post(url, auth=auth, headers=headers, data=data)
+#         response.raise_for_status()  # Raise an error if the request fails
+        
+#         Parse the JSON response
+#         api_response = response.json()
+        
+#         Check if the API call was successful
+#         if response.status_code != 200 or not api_response.get('success'):
+#             logger.warning("Currently, weather information is unavailable. Please try again shortly.")
+#             return {"error": "Currently, weather information is unavailable. Please try again shortly."}
+            
+#         Extract and simplify the weather data
+#         if not api_response.get('record') or not api_response.get('record').get('daily'):
+#             logger.warning("Invalid response format from weather API")
+#             return {"error": "Currently, weather information is unavailable. Please try again shortly."}
+        
+#         record = api_response['record']
+#         daily_data = record.get('daily', [])
+        
+#         Create a simplified response
+#         simplified_weather = {
+#             "current": {},
+#             "forecast": []
+#         }
+        
+#         Process current day and forecast
+#         for i, day in enumerate(daily_data):
+#             day_data = {
+#                 "date": day.get('date'),
+#                 "day_of_week": day.get('dayOfWeek'),
+#                 "condition": day.get('weatherConditionEnglish'),
+#                 "temperature": day.get('temp'),
+#                 "min_temperature": day.get('minTemp'),
+#                 "max_temperature": day.get('maxTemp'),
+#                 "humidity": day.get('hum'),
+#                 "pressure": day.get('pressure'),
+#                 "wind_speed": day.get('windSpeed'),
+#                 "cloud_cover": day.get('cloudCover'),
+#                 "uv_index": day.get('uv'),
+#                 "precipitation_type": day.get('precType'),
+#                 "sunrise": day.get('sunrise'),
+#                 "sunset": day.get('sunset')
+#             }
+            
+#             Add daily parts breakdown if available
+#             if day.get('intraday'):
+#                 day_data["day_parts"] = []
+#                 for part in day.get('intraday', []):
+#                     day_data["day_parts"].append({
+#                         "name": part.get('daypartName'),
+#                         "min_temp": part.get('minTemp'),
+#                         "max_temp": part.get('maxTemp'),
+#                         "condition": part.get('english'),
+#                         "day_or_night": "Day" if part.get('dayOrNight') == 'D' else "Night"
+#                     })
+            
+#             First day is current day
+#             if i == 0:
+#                 simplified_weather["current"] = day_data
+            
+#             All days go to forecast
+#             simplified_weather["forecast"].append(day_data)
+        
+#         logger.info("Weather data successfully fetched and processed")
+#         return simplified_weather
+        
+#     except requests.exceptions.HTTPError as e:
+#         logger.error(f"HTTP error occurred while fetching weather: {str(e)}")
+#         return {"error": f"HTTP error occurred: {str(e)}"}
+#     except requests.exceptions.RequestException as e:
+#         logger.error(f"Request failed while fetching weather: {str(e)}")
+#         return {"error": f"Request failed: {str(e)}"}
+#     except Exception as e:
+#         logger.error(f"An unexpected error occurred while fetching weather: {str(e)}")
+#         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 def get_weather_by_location(location_name: str) -> Dict[str, Any]:
     """Get weather information for a location by name."""
@@ -359,8 +441,52 @@ def fetch_weather_by_location(location_name: str) -> dict:
     """Fetches weather data by location name."""
     return get_weather_by_location(location_name)
 
+@tool
+def fetch_today_weather_by_location(location_name: str) -> dict:
+    """Fetch today's weather based on location name."""
+    loc = get_coordinates(location_name)
+    if "error" in loc:
+        return loc
+    data = get_weather(loc["latitude"], loc["longitude"])
+    data["location"] = loc
+    return {"today": data["current"], "location": loc, "timestamp": data["current_timestamp"]}
+
+@tool
+def fetch_hourly_weather_by_location(location_name: str) -> dict:
+    """Fetch hourly weather for today based on location name."""
+    loc = get_coordinates(location_name)
+    if "error" in loc:
+        return loc
+    data = get_weather(loc["latitude"], loc["longitude"])
+    data["location"] = loc
+    return {
+        "today": data["current"].get("hourly_flattened", []),
+        "location": loc,
+        "timestamp": data["current_timestamp"]
+    }
+
+@tool
+def fetch_forecast_weather_by_location(location_name: str) -> dict:
+    """Fetch multi-day forecast for a location."""
+    loc = get_coordinates(location_name)
+    if "error" in loc:
+        return loc
+    data = get_weather(loc["latitude"], loc["longitude"])
+    data["location"] = loc
+    return {
+        "forecast": data.get("forecast", []),
+        "location": loc,
+        "timestamp": data["current_timestamp"]
+    }
+
 # Tools list
-tools = [fetch_weather, fetch_weather_by_location]
+tools = [
+    fetch_weather, 
+    fetch_weather_by_location,
+    fetch_today_weather_by_location,
+    fetch_hourly_weather_by_location,
+    fetch_forecast_weather_by_location
+    ]
 
 # Now bind tools explicitly (after llm is initialized)
 llm_with_tools = llm.bind_tools(tools)
@@ -425,6 +551,12 @@ def enhanced_chatbot(state: StateWithMemory) -> Dict:
                     tool_result = get_weather_by_location(**tool_args)
                 elif tool_name == "fetch_weather":
                     tool_result = get_weather(**tool_args)
+                elif tool_name == "fetch_today_weather_by_location":
+                    tool_result = fetch_today_weather_by_location.invoke(tool_args)
+                elif tool_name == "fetch_hourly_weather_by_location":
+                    tool_result = fetch_hourly_weather_by_location.invoke(tool_args)
+                elif tool_name == "fetch_forecast_weather_by_location":
+                    tool_result = fetch_forecast_weather_by_location.invoke(tool_args)
                 else:
                     logger.error(f"Unknown tool requested: {tool_name}")
                     continue
@@ -465,18 +597,6 @@ graph_builder.add_edge("tools", "context_updater")
 # Explicitly compile with return_only=True
 react_graph = graph_builder.compile()
 
-# def convert_audio_to_wav(input_audio):
-#     """Convert audio file to WAV format (16kHz, mono) for processing."""
-#     temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-#     try:
-#         audio = AudioSegment.from_file(input_audio)
-#         audio = audio.set_frame_rate(16000).set_channels(1)
-#         audio.export(temp_wav, format="wav")
-#         return temp_wav
-#     except Exception as e:
-#         logger.error(f"Error converting audio to WAV: {str(e)}")
-#         return None
-
 def convert_audio_to_wav(input_audio):
     """
     Convert audio file to WAV format (16kHz, mono) for processing.
@@ -488,11 +608,6 @@ def convert_audio_to_wav(input_audio):
     Returns:
         str: Path to the converted WAV file or None if conversion fails
     """
-    import os
-    import tempfile
-    import subprocess
-    from pydub import AudioSegment
-    
     temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
     logger.info(f"Attempting to convert audio file: {input_audio} to WAV format at {temp_wav}")
     
@@ -884,6 +999,7 @@ def chat_with_bot(message, bottype, state=None):
 # Flask Application
 app = Flask(__name__)
 
+CORS(app, origins="*")
 # Global state storage (in a real app, you'd use a database)
 user_states = {}
 
@@ -947,13 +1063,12 @@ def api_chat():
             context = new_state["conversation_context"]
         
         logger.info(f"Returning response: {response[:50]}...")
-        print(weather_api_data)
         # Include weather_api_response in the JSON response
         return jsonify({
             "status": "success",
             "code": 200,
             "response": response,
-            "weather_api_response": weather_api_data  # Add the weather API data to the response
+          
         })
     
     except Exception as e:
@@ -1024,7 +1139,6 @@ def api_audio_chat():
                 "code": 200,
                 "transcribed_text": response_text,
                 "saved_file_path": saved_path,
-                "weather_api_response": weather_data,
                 "user_id": user_id
             }
             
