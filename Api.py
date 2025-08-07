@@ -30,7 +30,7 @@ import requests
 import datetime
 # Initialize persistent session globally
 
-# Get current time
+
 current_datetime = datetime.datetime.now()
 
 # Add 5 hours
