@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 import logging
+from flask_cors import CORS
 import traceback
 from IPython.display import Image, display
 from langgraph.graph import StateGraph, START, END
@@ -47,14 +48,16 @@ logging.basicConfig(
 )
 
 # Configure logging
-# Load environment variables
-
 
 logger = logging.getLogger(__name__)
+# Load environment variables
 load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
 # Configure OpenAI client
+
+# Load environment variables
+
 
 client = openai.OpenAI(api_key=openai_api_key)
 
@@ -884,6 +887,7 @@ def chat_with_bot(message, bottype, state=None):
 # Flask Application
 app = Flask(__name__)
 
+CORS(app, origins="*")
 # Global state storage (in a real app, you'd use a database)
 user_states = {}
 
